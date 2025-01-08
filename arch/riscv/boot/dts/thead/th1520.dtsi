@@ -1767,8 +1767,8 @@
 			light,sel = "ap_i2s";
 			interrupt-parent = <&intc>;
 			interrupts = <70>;
-			dmas = <&dmac0 35>, <&dmac0 40>;
-			dma-names = "tx", "rx";
+			dmas = <&dmac0 35>;
+			dma-names = "tx";
 			light,dma_maxburst = <4>;
 			#dma-cells = <1>;
 			clocks = <&vosys_clk_gate LIGHT_CLKGEN_HDMI_I2S_CLK>;

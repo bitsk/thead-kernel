@@ -66,6 +66,10 @@ static bool debug;
 module_param(debug, bool, 0444);
 MODULE_PARM_DESC(debug, "print a lot of debug information");
 
+#ifdef CONFIG_HS_MH248
+	extern bool get_hall_status(void);
+#endif
+
 #define i2c_hid_dbg(ihid, fmt, arg...)					  \
 do {									  \
 	if (debug)							  \
@@ -262,13 +266,22 @@ static int __i2c_hid_command(struct i2c_client *client,
 	if (wait)
 		set_bit(I2C_HID_RESET_PENDING, &ihid->flags);
 
-	ret = i2c_transfer(client->adapter, msg, msg_num);
+	int retry = 10;
+	while(retry) {
+		ret = i2c_transfer(client->adapter, msg, msg_num);
 
-	if (data_len > 0)
-		clear_bit(I2C_HID_READ_PENDING, &ihid->flags);
+		if (data_len > 0)
+			clear_bit(I2C_HID_READ_PENDING, &ihid->flags);
 
-	if (ret != msg_num)
+		if (ret == msg_num) {
+			break;
+		}
+		retry--;
+	}
+
+	if (ret != msg_num) {
 		return ret < 0 ? ret : -EIO;
+	}
 
 	ret = 0;
 
@@ -1166,6 +1179,9 @@ static int i2c_hid_probe(struct i2c_client *client,
 		goto err_mem_free;
 	}
 
+	if (client->dev.of_node && of_property_read_bool(client->dev.of_node, "wakeup-source"))
+		device_init_wakeup(&client->dev, 1);
+
 	return 0;
 
 err_mem_free:
@@ -1189,6 +1205,10 @@ static int i2c_hid_remove(struct i2c_client *client)
 	hid = ihid->hid;
 	hid_destroy_device(hid);
 
+	if (device_may_wakeup(&client->dev))
+		device_init_wakeup(&client->dev, 0);
+
+
 	free_irq(client->irq, ihid);
 
 	if (ihid->bufsize)
@@ -1204,6 +1224,9 @@ static void i2c_hid_shutdown(struct i2c_client *client)
 {
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 
+	if (device_may_wakeup(&client->dev))
+		device_init_wakeup(&client->dev, 0);
+
 	i2c_hid_set_power(client, I2C_HID_PWR_SLEEP);
 	free_irq(client->irq, ihid);
 
@@ -1216,6 +1239,7 @@ static int i2c_hid_suspend(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 	struct hid_device *hid = ihid->hid;
+	bool hall_open = true;
 	int ret;
 	int wake_status;
 
@@ -1228,8 +1252,6 @@ static int i2c_hid_suspend(struct device *dev)
 	/* Save some power */
 	i2c_hid_set_power(client, I2C_HID_PWR_SLEEP);
 
-	disable_irq(client->irq);
-
 	if (device_may_wakeup(&client->dev)) {
 		wake_status = enable_irq_wake(client->irq);
 		if (!wake_status)
@@ -1239,9 +1261,16 @@ static int i2c_hid_suspend(struct device *dev)
 				wake_status);
 	} else {
 		regulator_bulk_disable(ARRAY_SIZE(ihid->pdata.supplies),
-				       ihid->pdata.supplies);
+					ihid->pdata.supplies);
 	}
 
+#ifdef CONFIG_HS_MH248
+	hall_open = get_hall_status();
+#endif
+
+	if(!hall_open) {
+		disable_irq(client->irq);
+	}
 	return 0;
 }
 
