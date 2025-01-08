@@ -76,7 +76,15 @@
 		vin-supply = <&reg_sys_vcc_5v>;
 		gpio = <&pcal6408ahk_c 1 1>;
 		enable-active-high;
+		regulator-boot-on;
 		regulator-always-on;
+	};
+
+	sata_pwr_switch: sata-pwr-switch {
+		status = "okay";
+		compatible = "reg-userspace-consumer";
+		regulator-name = "sata-pwr-consumer";
+		vcc-supply = <&reg_sata_vcc_5v>;
 	};
 
 	audio_amp: regulator-audio-amp-en {
@@ -137,14 +145,12 @@
 };
 
 &wcn_wifi {
-	// WIFI,poweren_gpio = <&pcal6408ahk_c 4 0>;
-	/delete-property/ WIFI,poweren_gpio;
+	WIFI,poweren_gpio = <&pcal6408ahk_c 4 0>;
 };
 
 
 &wcn_bt {
-	// BT,power_gpio = <&pcal6408ahk_c 5 0>;
-	/delete-property/ BT,power_gpio;
+	BT,power_gpio = <&pcal6408ahk_c 5 0>;
 };
 
 &usb_1 {

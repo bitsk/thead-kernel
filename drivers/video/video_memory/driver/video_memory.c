@@ -86,6 +86,7 @@
 #include "video_memory.h"
 #include "rsvmem_pool.h"
 
+
 //#define VIDMEM_DMA_MAP
 #define DISCRETE_PAGES 0
 //#define VIDMEM_DEBUG
@@ -183,6 +184,7 @@
 #ifndef VIDMEM_DEBUG
 #define DEBUG_PRINT(...) \
   do {                     \
+        pr_debug(__VA_ARGS__);\
   } while (0)
 #else
 #undef DEBUG_PRINT
@@ -202,8 +204,9 @@ struct mem_block
     struct vm_area_struct     * vma;
     bool is_cma;
     bool is_vi_mem;
+    bool cache_en;
     void *va;
-
+    struct file *filp;
     union
     {
         /* Pointer to a array of pages. */
@@ -232,6 +235,7 @@ struct mem_node
     struct mem_block memBlk;
     unsigned long busAddr;
     int isImported;
+    int isExported;
     struct list_head link;
 };
 
@@ -243,6 +247,9 @@ struct file_node
 };
 
 static struct list_head fileList;
+/* golbal list for exported mem_node */
+static struct list_head export_list;
+static DEFINE_SPINLOCK(export_mem_lock);
 
 static int vidalloc_major = 0;
 static int vidalloc_minor = 0;
@@ -259,6 +266,7 @@ getPhysical(
     IN unsigned int Offset,
     OUT unsigned long * Physical
     );
+void free_memblk_pages(struct mem_block *memBlk);
 
 static struct file_node * find_and_delete_file_node(struct file *filp)
 {
@@ -298,6 +306,23 @@ static struct file_node * get_file_node(struct file *filp)
     return NULL;
 }
 
+static struct mem_node * get_export_mem_node(struct file *filp, unsigned long bus_address)
+{
+    struct mem_node *node;
+    spin_lock(&export_mem_lock);
+    list_for_each_entry(node, &export_list, link)
+    {
+        if (node->busAddr == bus_address)
+        {
+            DEBUG_PRINT("[vidmem] Found export mem node %px, %d pages\n", node);
+            spin_unlock(&export_mem_lock);
+            return node;
+        }
+    }
+    spin_unlock(&export_mem_lock);
+    return NULL;
+}
+
 static struct mem_node * get_mem_node(struct file *filp, unsigned long bus_address, int imported)
 {
     struct file_node *fnode;
@@ -319,6 +344,7 @@ static struct mem_node * get_mem_node(struct file *filp, unsigned long bus_addre
         }
     }
     spin_unlock(&mem_lock);
+
 
     return NULL;
 }
@@ -441,6 +467,46 @@ OnError:
     return status;
 }
 
+
+static void invalid_data_cache(IN struct file *filp, IN unsigned long bus_address )
+{
+    struct mem_block *memBlk = NULL;
+    struct mem_node *mnode = NULL;
+    mnode = get_mem_node(filp, bus_address, 0);
+    if (NULL == mnode)
+    {
+        mnode = get_export_mem_node(filp, bus_address);
+        if (NULL == mnode)
+            return;
+    }
+
+    memBlk = &mnode->memBlk;
+    dma_addr_t dma_handle = memBlk->dma_addr;
+    size_t size = memBlk->size;
+    dma_sync_single_for_cpu(gdev,dma_handle ,memBlk->size,DMA_FROM_DEVICE);
+
+}
+
+static void flush_data_cache(IN struct file *filp, IN unsigned long bus_address )
+{
+    struct mem_block *memBlk = NULL;
+    struct mem_node *mnode = NULL;
+
+    mnode = get_mem_node(filp, bus_address, 0);
+    if (NULL == mnode)
+    {
+        mnode = get_export_mem_node(filp, bus_address);
+        if (NULL == mnode)
+            return;
+    }
+
+    memBlk = &mnode->memBlk;
+    dma_addr_t dma_handle = memBlk->dma_addr;
+    size_t size = memBlk->size;
+    dma_sync_single_for_device(gdev,dma_handle ,memBlk->size,DMA_TO_DEVICE);
+
+}
+
 static int
 Mmap(
     IN struct mem_block *MemBlk,
@@ -455,16 +521,21 @@ Mmap(
     vma->vm_flags |= VM_FLAGS;
 
     /* Make this mapping write combined. */
-    vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-
+    if (!memBlk->cache_en) {
+        vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+    }
+    DEBUG_PRINT("vm_page_prot:0x%llx\n",vma->vm_page_prot);
     /* Now map all the vmalloc pages to this user address. */
     if (memBlk->contiguous)
     {
         /* map kernel memory to user space.. */
+        #if 0
         if (memBlk->is_cma == true) {
             return dma_mmap_coherent(gdev, vma, memBlk->va,
 					   memBlk->dma_addr, vma->vm_end - vma->vm_start);
-        } else {
+        } else
+        #endif
+        {
             if (remap_pfn_range(vma,
                                 vma->vm_start,
                                 page_to_pfn(memBlk->contiguousPages) + skipPages,
@@ -658,6 +729,29 @@ OnError:
 
 static void _dmabuf_release(struct dma_buf *dmabuf)
 {
+    struct mem_block *memBlk = dmabuf->priv;
+    unsigned long physical;
+    //struct mem_node *mnode = (mem_node *)memBlk;
+    struct mem_node *mnode = container_of(memBlk,struct mem_node,memBlk);
+    if (!memBlk)
+        return;
+    if(!memBlk->filp)
+    {
+        DEBUG_PRINT("[vidmem] %s, %d: memBlk filp null\n", __func__, __LINE__);
+        return;
+    }
+    getPhysical(memBlk, 0, &physical);
+    DEBUG_PRINT("[vidmem] %s, %d: free physical %llx,mnode %px\n", __func__, __LINE__,physical,mnode);
+
+    free_memblk_pages(memBlk);
+    DEBUG_PRINT("  %s: remove node\n",__func__);
+    //remove node from export gloabl list
+    spin_lock(&export_mem_lock);
+    list_del(&mnode->link);
+    spin_unlock(&export_mem_lock);
+    DEBUG_PRINT("  %s: FreeMemory of node\n",__func__);
+    FreeMemory(mnode);
+    dmabuf->priv = NULL;
 }
 
 static void *_dmabuf_kmap(struct dma_buf *dmabuf, unsigned long offset)
@@ -706,6 +800,8 @@ DMABUF_Export(
     }
 
     memBlk = &mnode->memBlk;
+    memBlk->filp = filp;
+    mnode->isExported = 1;
 
     dmabuf = memBlk->dmabuf;
     if (dmabuf == NULL)
@@ -739,8 +835,18 @@ DMABUF_Export(
         }
 
         *FD = fd;
+        DEBUG_PRINT("  [vidmem] Export  as fd %d,mnode %px memBlk %px\n", fd,mnode,&mnode->memBlk);
     }
 
+    /*exported buffer remove from list*/
+    spin_lock(&mem_lock);
+    list_del(&mnode->link);
+    spin_unlock(&mem_lock);
+
+    /* add to export gloabl list*/
+    spin_lock(&export_mem_lock);
+    list_add_tail(&mnode->link,&export_list);
+    spin_unlock(&export_mem_lock);
 OnError:
     return status;
 }
@@ -775,7 +881,7 @@ DMABUF_Import(
     }
 
     memBlk = &mnode->memBlk;
-
+    memBlk->filp = filp;
     /* Import dma buf handle. */
     memBlk->dmabuf = dma_buf_get(FD);
     if (!memBlk->dmabuf)
@@ -815,7 +921,7 @@ DMABUF_Release(
 {
     struct mem_block *memBlk = NULL;
     struct mem_node *mnode = NULL;
-
+    DEBUG_PRINT("[vidmem] enter %s: bus_address 0x%lx\n",__func__, bus_address);
     mnode = get_mem_node(filp, bus_address, 1);
     if (NULL == mnode)
     {
@@ -832,6 +938,7 @@ DMABUF_Release(
 
     FreeMemory(memBlk->pagearray);
 
+    DEBUG_PRINT("[vidmem] release bus address at 0x%lx in size of %ld\n", bus_address, memBlk->size);
     spin_lock(&mem_lock);
     list_del(&mnode->link);
     spin_unlock(&mem_lock);
@@ -991,6 +1098,13 @@ GFP_Alloc(
         gfp |= __GFP_DMA32;
     }
 
+
+    if (Flags & ALLOC_FLAG_ENABLE_CACHE) {
+        memBlk->cache_en = true;
+    } else {
+        memBlk->cache_en = false;
+    }
+
     memBlk->contiguous = contiguous;
     memBlk->numPages = numPages;
     memBlk->size = size;
@@ -1133,7 +1247,9 @@ OnDone:
     *bus_address = physical;
     mnode->busAddr = physical;
     mnode->isImported = 0;
+    spin_lock(&mem_lock);
     list_add_tail(&mnode->link, &fnode->memList);
+    spin_unlock(&mem_lock);
 
     DEBUG_PRINT("[vidmem] Allocated %d bytes (%ld pages) at physical address 0x%lx with %d sg table entries\n",
         size, numPages, physical, contiguous ? 1 : memBlk->sgt->nents);
@@ -1154,27 +1270,11 @@ OnError:
     return status;
 }
 
-
-void
-GFP_Free(
-    IN struct file *filp,
-    IN unsigned long bus_address
-    )
+void free_memblk_pages(struct mem_block *memBlk)
 {
     size_t i;
     struct page * page;
-    struct mem_block *memBlk = NULL;
-    struct mem_node *mnode = NULL;
-
-    mnode = get_mem_node(filp, bus_address, 0);
-    if (NULL == mnode)
-    {
-        return;
-    }
-
-    memBlk = &mnode->memBlk;
-
-    DEBUG_PRINT("[vidmem] Free %ld pages from physical address 0x%lx\n", memBlk->numPages, mnode->busAddr);
+    DEBUG_PRINT("   ##[vidmem] Free %ld pages, contiguous %d\n", memBlk->numPages, memBlk->contiguous);
 
     if (memBlk->contiguous)
     {
@@ -1235,6 +1335,27 @@ GFP_Free(
     {
         NonContiguousFree(memBlk->nonContiguousPages, memBlk->numPages);
     }
+}
+
+void
+GFP_Free(
+    IN struct file *filp,
+    IN unsigned long bus_address
+    )
+{
+    struct mem_block *memBlk = NULL;
+    struct mem_node *mnode = NULL;
+
+    mnode = get_mem_node(filp, bus_address, 0);
+    if (NULL == mnode)
+    {
+        return;
+    }
+
+    memBlk = &mnode->memBlk;
+    DEBUG_PRINT("[vidmem] Free %ld pages from physical address 0x%lx\n", memBlk->numPages, mnode->busAddr);
+
+    free_memblk_pages(memBlk);
 
     spin_lock(&mem_lock);
     list_del(&mnode->link);
@@ -1256,7 +1377,9 @@ GFP_MapUser(
     mnode = get_mem_node(filp, bus_address, 0);
     if (NULL == mnode)
     {
-        return EINVAL;
+        mnode = get_export_mem_node(filp, bus_address);
+        if (NULL == mnode)
+            return EINVAL;
     }
 
     memBlk = &mnode->memBlk;
@@ -1349,6 +1472,21 @@ static long vidalloc_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
         }
         break;
     }
+
+    case MEMORY_IOC_DMABUF_FLUSH_CACHE:
+        ret = copy_from_user(&params, (void*)arg, sizeof(VidmemParams));
+        if (!ret)
+        {
+            flush_data_cache(filp, params.bus_address);
+        }
+        break;
+    case MEMORY_IOC_DMABUF_INVALID_CACHE:
+        ret = copy_from_user(&params, (void*)arg, sizeof(VidmemParams));
+        if (!ret)
+        {
+            invalid_data_cache(filp, params.bus_address);
+        }
+        break;
     default:
         ret = EINVAL;
     }
@@ -1385,7 +1523,11 @@ static int vidalloc_release(struct inode *inode, struct file *filp)
     list_for_each_entry_safe(node, temp, &fnode->memList, link)
     {
         // this is not expected, memory leak detected!
-        pr_debug("vidmem: Found unfreed memory at 0x%lx, isImported = %d\n", node->busAddr, node->isImported);
+        pr_debug("vidmem: Found unfreed memory at 0x%lx, isImported = %d isExported = %d\n", node->busAddr, node->isImported,node->isExported);
+        if (node->isExported) //let dmabuf release ops free
+        {
+            continue;
+        }
         if (node->isImported)
             DMABUF_Release(filp, node->busAddr);
         else
@@ -1415,10 +1557,11 @@ int vidalloc_probe(struct platform_device *pdev)
 {
     int result = 0;
 
-    DEBUG_PRINT("enter %s\n",__func__);
+    pr_info("enter %s,ver:1.2A\n",__func__);
 #if 1
     gdev = &pdev->dev;
     INIT_LIST_HEAD(&fileList);
+    INIT_LIST_HEAD(&export_list);
 
     result = rsvmem_pool_create(&pdev->dev);
     if (result && result != -ENODEV)
